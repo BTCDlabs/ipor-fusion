@@ -28,7 +28,13 @@ contract SPOLUnstakeFuseTest is Test {
     error NoOpenNonces(address user);
     error NoNoncesReady(address user);
 
-    event SPOLUnstakeFuseEnter(address version, address controller, uint256 spolAmount, uint256 polAmount);
+    event SPOLUnstakeFuseEnter(
+        address version,
+        address controller,
+        uint256 spolAmount,
+        uint256 polAmount,
+        uint256 timestamp
+    );
 
     PriceOracleMiddleware private priceOracleMiddlewareProxy;
     SPOLUnstakeFuse private unstakeFuse;
@@ -68,10 +74,17 @@ contract SPOLUnstakeFuseTest is Test {
         assertEq(vault.balanceOf(), 0, "Balance fuse should report 0 before unstake");
 
         // when
+        uint256 operationTimestamp = 1_753_000_000;
+
         vm.expectEmit(true, true, true, true, address(vault));
-        emit SPOLUnstakeFuseEnter(address(unstakeFuse), SPOL_CONTROLLER, spolAmount, expectedPol);
+        emit SPOLUnstakeFuseEnter(address(unstakeFuse), SPOL_CONTROLLER, spolAmount, expectedPol, operationTimestamp);
         _enter(
-            SPOLUnstakeFuseEnterData({controller: SPOL_CONTROLLER, spolAmount: spolAmount, minPolAmountOut: expectedPol})
+            SPOLUnstakeFuseEnterData({
+                controller: SPOL_CONTROLLER,
+                spolAmount: spolAmount,
+                minPolAmountOut: expectedPol,
+                timestamp: operationTimestamp
+            })
         );
 
         // then
@@ -99,7 +112,17 @@ contract SPOLUnstakeFuseTest is Test {
         uint256 expectedPol = ISPOLController(SPOL_CONTROLLER).convertSPOLtoPOL(spolBalance);
 
         // when
-        _enter(SPOLUnstakeFuseEnterData({controller: SPOL_CONTROLLER, spolAmount: 500e18, minPolAmountOut: 0}));
+        // timestamp 0 falls back to block.timestamp in the event
+        vm.expectEmit(true, true, true, true, address(vault));
+        emit SPOLUnstakeFuseEnter(address(unstakeFuse), SPOL_CONTROLLER, spolBalance, expectedPol, block.timestamp);
+        _enter(
+            SPOLUnstakeFuseEnterData({
+                controller: SPOL_CONTROLLER,
+                spolAmount: 500e18,
+                minPolAmountOut: 0,
+                timestamp: 0
+            })
+        );
 
         // then
         assertEq(IERC20(SPOL).balanceOf(address(vault)), 0, "Full sPOL balance should be burned");
@@ -117,7 +140,7 @@ contract SPOLUnstakeFuseTest is Test {
         _grantControllerSubstrate();
 
         // when
-        _enter(SPOLUnstakeFuseEnterData({controller: SPOL_CONTROLLER, spolAmount: 0, minPolAmountOut: 0}));
+        _enter(SPOLUnstakeFuseEnterData({controller: SPOL_CONTROLLER, spolAmount: 0, minPolAmountOut: 0, timestamp: 0}));
 
         // then
         assertEq(
@@ -129,7 +152,9 @@ contract SPOLUnstakeFuseTest is Test {
 
     function testShouldRevertWhenControllerNotGranted() external {
         vm.expectRevert(abi.encodeWithSelector(SPOLUnstakeFuseUnsupportedController.selector, SPOL_CONTROLLER));
-        _enter(SPOLUnstakeFuseEnterData({controller: SPOL_CONTROLLER, spolAmount: 100e18, minPolAmountOut: 0}));
+        _enter(
+            SPOLUnstakeFuseEnterData({controller: SPOL_CONTROLLER, spolAmount: 100e18, minPolAmountOut: 0, timestamp: 0})
+        );
     }
 
     function testShouldRevertWhenPolOutBelowMinimum() external {
@@ -148,14 +173,15 @@ contract SPOLUnstakeFuseTest is Test {
             SPOLUnstakeFuseEnterData({
                 controller: SPOL_CONTROLLER,
                 spolAmount: spolAmount,
-                minPolAmountOut: expectedPol + 1
+                minPolAmountOut: expectedPol + 1,
+                timestamp: 0
             })
         );
     }
 
     function testShouldRevertExitWhenControllerNotGranted() external {
         vm.expectRevert(abi.encodeWithSelector(SPOLUnstakeFuseUnsupportedController.selector, SPOL_CONTROLLER));
-        _exit(SPOLUnstakeFuseExitData({controller: SPOL_CONTROLLER}));
+        _exit(SPOLUnstakeFuseExitData({controller: SPOL_CONTROLLER, timestamp: 0}));
     }
 
     function testShouldRevertExitWhenQueueIsEmpty() external {
@@ -164,7 +190,7 @@ contract SPOLUnstakeFuseTest is Test {
 
         // when / then
         vm.expectRevert(abi.encodeWithSelector(NoOpenNonces.selector, address(vault)));
-        _exit(SPOLUnstakeFuseExitData({controller: SPOL_CONTROLLER}));
+        _exit(SPOLUnstakeFuseExitData({controller: SPOL_CONTROLLER, timestamp: 0}));
     }
 
     function testShouldRevertExitWhenNoNonceMaturedYet() external {
@@ -173,19 +199,26 @@ contract SPOLUnstakeFuseTest is Test {
         uint256 spolAmount = 100e18;
         deal(SPOL, address(vault), spolAmount);
 
-        _enter(SPOLUnstakeFuseEnterData({controller: SPOL_CONTROLLER, spolAmount: spolAmount, minPolAmountOut: 0}));
+        _enter(
+            SPOLUnstakeFuseEnterData({
+                controller: SPOL_CONTROLLER,
+                spolAmount: spolAmount,
+                minPolAmountOut: 0,
+                timestamp: 0
+            })
+        );
 
         // when / then - the ~80 checkpoint cooldown cannot be warped on a fork
         vm.expectRevert(abi.encodeWithSelector(NoNoncesReady.selector, address(vault)));
-        _exit(SPOLUnstakeFuseExitData({controller: SPOL_CONTROLLER}));
+        _exit(SPOLUnstakeFuseExitData({controller: SPOL_CONTROLLER, timestamp: 0}));
     }
 
     function _enter(SPOLUnstakeFuseEnterData memory data) private {
-        vault.execute(address(unstakeFuse), abi.encodeWithSignature("enter((address,uint256,uint256))", data));
+        vault.execute(address(unstakeFuse), abi.encodeWithSignature("enter((address,uint256,uint256,uint256))", data));
     }
 
     function _exit(SPOLUnstakeFuseExitData memory data) private {
-        vault.execute(address(unstakeFuse), abi.encodeWithSignature("exit((address))", data));
+        vault.execute(address(unstakeFuse), abi.encodeWithSignature("exit((address,uint256))", data));
     }
 
     function _grantControllerSubstrate() private {

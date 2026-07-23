@@ -18,12 +18,16 @@ struct SPOLUnstakeFuseEnterData {
     uint256 spolAmount;
     /// @dev minimum POL (18 decimals) to be queued for the unstaked sPOL; reverts if the current rate yields less
     uint256 minPolAmountOut;
+    /// @dev caller-supplied timestamp echoed in the enter event for off-chain correlation; 0 = block.timestamp
+    uint256 timestamp;
 }
 
 /// @notice Data structure for exiting the sPOL unstake fuse (claim matured POL)
 struct SPOLUnstakeFuseExitData {
     /// @dev sPOLController address; must be granted as a substrate of MARKET_ID
     address controller;
+    /// @dev caller-supplied timestamp echoed in the exit event for off-chain correlation; 0 = block.timestamp
+    uint256 timestamp;
 }
 
 /// @notice Thrown when the controller is not granted as a substrate of the fuse's market
@@ -71,13 +75,21 @@ contract SPOLUnstakeFuse is IFuseCommon {
     /// @param controller sPOLController the unstake was sent to
     /// @param spolAmount Amount of sPOL burned
     /// @param polAmount Amount of POL queued (fixed at the current rate)
-    event SPOLUnstakeFuseEnter(address version, address controller, uint256 spolAmount, uint256 polAmount);
+    /// @param timestamp Caller-supplied timestamp for off-chain correlation (block.timestamp when 0 was given)
+    event SPOLUnstakeFuseEnter(
+        address version,
+        address controller,
+        uint256 spolAmount,
+        uint256 polAmount,
+        uint256 timestamp
+    );
 
     /// @notice Emitted when exiting (claiming matured POL)
     /// @param version Address of the fuse
     /// @param controller sPOLController the claim was sent to
     /// @param polAmount Amount of POL received by the vault
-    event SPOLUnstakeFuseExit(address version, address controller, uint256 polAmount);
+    /// @param timestamp Caller-supplied timestamp for off-chain correlation (block.timestamp when 0 was given)
+    event SPOLUnstakeFuseExit(address version, address controller, uint256 polAmount, uint256 timestamp);
 
     /// @notice Constructor
     /// @param marketIdInput Market ID
@@ -117,7 +129,13 @@ contract SPOLUnstakeFuse is IFuseCommon {
 
         controller.sellSPOL(finalAmount);
 
-        emit SPOLUnstakeFuseEnter(VERSION, data.controller, finalAmount, polAmount);
+        emit SPOLUnstakeFuseEnter(
+            VERSION,
+            data.controller,
+            finalAmount,
+            polAmount,
+            data.timestamp == 0 ? block.timestamp : data.timestamp
+        );
     }
 
     /// @notice Enters using transient storage for input/output
@@ -128,7 +146,8 @@ contract SPOLUnstakeFuse is IFuseCommon {
             SPOLUnstakeFuseEnterData({
                 controller: TypeConversionLib.toAddress(inputs[0]),
                 spolAmount: TypeConversionLib.toUint256(inputs[1]),
-                minPolAmountOut: TypeConversionLib.toUint256(inputs[2])
+                minPolAmountOut: TypeConversionLib.toUint256(inputs[2]),
+                timestamp: TypeConversionLib.toUint256(inputs[3])
             })
         );
 
@@ -156,14 +175,24 @@ contract SPOLUnstakeFuse is IFuseCommon {
 
         polAmount = polToken.balanceOf(address(this)) - polBefore;
 
-        emit SPOLUnstakeFuseExit(VERSION, data.controller, polAmount);
+        emit SPOLUnstakeFuseExit(
+            VERSION,
+            data.controller,
+            polAmount,
+            data.timestamp == 0 ? block.timestamp : data.timestamp
+        );
     }
 
     /// @notice Exits using transient storage for input/output
     function exitTransient() external {
         bytes32[] memory inputs = TransientStorageLib.getInputs(VERSION);
 
-        uint256 polAmount = exit(SPOLUnstakeFuseExitData({controller: TypeConversionLib.toAddress(inputs[0])}));
+        uint256 polAmount = exit(
+            SPOLUnstakeFuseExitData({
+                controller: TypeConversionLib.toAddress(inputs[0]),
+                timestamp: TypeConversionLib.toUint256(inputs[1])
+            })
+        );
 
         bytes32[] memory outputs = new bytes32[](1);
         outputs[0] = TypeConversionLib.toBytes32(polAmount);
