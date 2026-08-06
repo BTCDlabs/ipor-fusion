@@ -2,6 +2,7 @@
 pragma solidity 0.8.30;
 
 import {IERC20} from "@openzeppelin/contracts/interfaces/IERC20.sol";
+import {SafeERC20} from "@openzeppelin/contracts/token/ERC20/utils/SafeERC20.sol";
 
 import {IporMath} from "../../../../libraries/math/IporMath.sol";
 import {TypeConversionLib} from "../../../../libraries/TypeConversionLib.sol";
@@ -9,6 +10,8 @@ import {PlasmaVaultConfigLib} from "../../../../libraries/PlasmaVaultConfigLib.s
 import {TransientStorageLib} from "../../../../transient_storage/TransientStorageLib.sol";
 import {IFuseCommon} from "../../../IFuseCommon.sol";
 import {ISPOLController} from "./ext/ISPOLController.sol";
+import {SPOLUnstakeExecutor} from "./SPOLUnstakeExecutor.sol";
+import {SPOLUnstakeExecutorStorageLib} from "./lib/SPOLUnstakeExecutorStorageLib.sol";
 
 /// @notice Data structure for entering the sPOL unstake fuse (sPOL -> pending POL)
 struct SPOLUnstakeFuseEnterData {
@@ -22,11 +25,19 @@ struct SPOLUnstakeFuseEnterData {
     uint256 timestamp;
 }
 
-/// @notice Data structure for exiting the sPOL unstake fuse (claim matured POL)
+/// @notice Data structure for exiting the sPOL unstake fuse (claim matured POL to the vault)
 struct SPOLUnstakeFuseExitData {
     /// @dev sPOLController address; must be granted as a substrate of MARKET_ID
     address controller;
     /// @dev caller-supplied timestamp echoed in the exit event for off-chain correlation; 0 = block.timestamp
+    uint256 timestamp;
+}
+
+/// @notice Data structure for the sweep action (flush executor-held tokens to the vault)
+struct SPOLUnstakeFuseSweepData {
+    /// @dev token to sweep from the vault's executor to the vault (POL, sPOL, or any stranded token)
+    address token;
+    /// @dev caller-supplied timestamp echoed in the sweep event for off-chain correlation; 0 = block.timestamp
     uint256 timestamp;
 }
 
@@ -36,23 +47,30 @@ error SPOLUnstakeFuseUnsupportedController(address controller);
 /// @notice Thrown when the POL amount queued for the unstake would be below the minimum required
 error SPOLUnstakeFuseInsufficientPolOut(uint256 polAmount, uint256 minPolAmountOut);
 
-/// @title Fuse for unstaking sPOL into POL via the sPOLController
+/// @notice Thrown when exit/sweep runs before any enter deployed the vault's executor
+error SPOLUnstakeFuseExecutorNotDeployed();
+
+/// @title Fuse for unstaking sPOL into POL via the sPOLController, routed through a per-vault executor
 /// @notice Enter burns the vault's sPOL through sellSPOL and queues a fixed POL amount in the controller's
-///         per-address FIFO cooldown queue (~80 checkpoints / ~3 days). Exit claims all matured POL.
-/// @dev Fuses execute via delegatecall, so the vault itself is msg.sender on the controller: the unstake
-///      nonces accrue to the vault and withdrawPOL pays the vault directly. No approval is needed —
-///      the controller has direct burn rights on sPOL.
+///         per-address FIFO cooldown queue (~80 checkpoints / ~3 days). Exit claims matured POL to the vault.
+///         Sweep flushes anomalously parked tokens from the executor to the vault.
+/// @dev WHY AN EXECUTOR: sPOLController.withdrawPOL(address user) is permissionless and always pays `user`.
+///      If the vault owned the queue, anyone could land POL in the vault wallet OUTSIDE vault execution;
+///      market balances are lazy snapshots, so a refresh touching the ERC20 market but not this market would
+///      double-count that POL, corrupting share quotes. Both enter and exit therefore route through a
+///      per-vault SPOLUnstakeExecutor that is msg.sender on the controller: the queue and payouts attribute
+///      to the executor, so a third-party withdrawPOL(executor) can only move POL onto the executor — which
+///      SPOLBalanceFuse counts in this same market (queue amounts are POL-denominated, so the market balance
+///      is invariant under third-party claims). Value reaches the vault wallet only inside execute(), where
+///      the dependency graph refreshes both market snapshots atomically.
 ///
-///      withdrawPOL(vault) on the controller is permissionless and always pays the vault, so keepers can
-///      claim matured POL without this fuse; exit() exists for alpha-driven atomic flows.
-///
-///      BALANCE & ACCOUNTING DEPENDENCY:
-///      After enter(), sPOL disappears from the vault's token balance and the pending POL claim appears
-///      on this fuse's market via SPOLBalanceFuse (sums getUserOpenNonces amounts). After exit() (or a
-///      keeper claim), the pending claim shrinks and POL appears in the vault's token balance.
+///      The executor is deployed lazily on the first enter and recorded in vault-local ERC-7201 storage
+///      (SPOLUnstakeExecutorStorageLib); resolve it off-chain via ReadSPOLUnstakeExecutor. Keepers may call
+///      the permissionless controller.withdrawPOL(executor) — the POL lands on the executor and is flushed
+///      to the vault by the sweep action.
 ///
 ///      Required configuration:
-///        - SPOLBalanceFuse on this fuse's market (values the pending POL queue)
+///        - SPOLBalanceFuse on this fuse's market (values the executor's pending queue + executor-held POL)
 ///        - sPOL and POL granted as substrates of the ERC20 balance market to track wallet balances
 ///        - POL price source configured in the vault's PriceOracleMiddleware
 ///        - Dependency graph: this fuse's market -> ERC20_VAULT_BALANCE market
@@ -64,17 +82,20 @@ error SPOLUnstakeFuseInsufficientPolOut(uint256 polAmount, uint256 minPolAmountO
 ///        │  SPOLBalanceFuse │         │  (sPOL/POL)      │
 ///        └──────────────────┘         └──────────────────┘
 contract SPOLUnstakeFuse is IFuseCommon {
+    using SafeERC20 for IERC20;
+
     /// @notice Address of this fuse contract
     address public immutable VERSION;
 
     /// @notice Market ID for the fuse
     uint256 public immutable MARKET_ID;
 
-    /// @notice Emitted when entering (sPOL -> pending POL in the cooldown queue)
+    /// @notice Emitted when entering (sPOL -> pending POL in the executor's cooldown queue)
     /// @param version Address of the fuse
     /// @param controller sPOLController the unstake was sent to
     /// @param spolAmount Amount of sPOL burned
-    /// @param polAmount Amount of POL queued (fixed at the current rate)
+    /// @param polAmount POL expected from the sale (fixed at the current rate; the queued amount).
+    ///        The realized amount is reported by the exit event and can be lower under validator slashing.
     /// @param timestamp Caller-supplied timestamp for off-chain correlation (block.timestamp when 0 was given)
     event SPOLUnstakeFuseEnter(
         address version,
@@ -84,12 +105,24 @@ contract SPOLUnstakeFuse is IFuseCommon {
         uint256 timestamp
     );
 
-    /// @notice Emitted when exiting (claiming matured POL)
+    /// @notice Emitted when exiting (claiming matured POL to the vault)
     /// @param version Address of the fuse
     /// @param controller sPOLController the claim was sent to
-    /// @param polAmount Amount of POL received by the vault
+    /// @param polAmount POL actually claimed and delivered to the vault (measured, slashing-aware)
     /// @param timestamp Caller-supplied timestamp for off-chain correlation (block.timestamp when 0 was given)
     event SPOLUnstakeFuseExit(address version, address controller, uint256 polAmount, uint256 timestamp);
+
+    /// @notice Emitted when sweeping a token from the vault's executor to the vault
+    /// @param version Address of the fuse
+    /// @param token Token swept
+    /// @param amount Amount transferred to the vault
+    /// @param timestamp Caller-supplied timestamp for off-chain correlation (block.timestamp when 0 was given)
+    event SPOLUnstakeFuseSweep(address version, address token, uint256 amount, uint256 timestamp);
+
+    /// @notice Emitted once per vault when the executor is deployed on the first enter
+    /// @param version Address of the fuse
+    /// @param executor The vault's SPOLUnstakeExecutor address (permanent)
+    event SPOLUnstakeFuseExecutorCreated(address version, address executor);
 
     /// @notice Constructor
     /// @param marketIdInput Market ID
@@ -98,8 +131,9 @@ contract SPOLUnstakeFuse is IFuseCommon {
         MARKET_ID = marketIdInput;
     }
 
-    /// @notice Enters by unstaking sPOL via sellSPOL, queueing the POL equivalent in the cooldown queue
-    /// @dev Validator routing is left to the controller (most-overfunded first, possibly multiple nonces)
+    /// @notice Enters by unstaking sPOL via the vault's executor, queueing the POL equivalent in the cooldown queue
+    /// @dev Deploys the executor on first use (after all guards, so failing calls never deploy). Validator
+    ///      routing is left to the controller (most-overfunded first, possibly multiple nonces).
     /// @param data The input data containing the controller, sPOL amount and rate guard
     /// @return polAmount The amount of POL queued for withdrawal after the cooldown
     function enter(SPOLUnstakeFuseEnterData memory data) public returns (uint256 polAmount) {
@@ -112,11 +146,9 @@ contract SPOLUnstakeFuse is IFuseCommon {
         }
 
         ISPOLController controller = ISPOLController(data.controller);
+        IERC20 spolToken = IERC20(controller.sPOLToken());
 
-        uint256 finalAmount = IporMath.min(
-            data.spolAmount,
-            IERC20(controller.sPOLToken()).balanceOf(address(this))
-        );
+        uint256 finalAmount = IporMath.min(data.spolAmount, spolToken.balanceOf(address(this)));
         if (finalAmount == 0) {
             return 0;
         }
@@ -127,7 +159,14 @@ contract SPOLUnstakeFuse is IFuseCommon {
             revert SPOLUnstakeFuseInsufficientPolOut(polAmount, data.minPolAmountOut);
         }
 
-        controller.sellSPOL(finalAmount);
+        address executor = SPOLUnstakeExecutorStorageLib.getExecutor();
+        if (executor == address(0)) {
+            executor = SPOLUnstakeExecutorStorageLib.getOrDeployExecutor(address(this));
+            emit SPOLUnstakeFuseExecutorCreated(VERSION, executor);
+        }
+
+        spolToken.safeTransfer(executor, finalAmount);
+        SPOLUnstakeExecutor(executor).unstake(data.controller, finalAmount);
 
         emit SPOLUnstakeFuseEnter(
             VERSION,
@@ -156,24 +195,23 @@ contract SPOLUnstakeFuse is IFuseCommon {
         TransientStorageLib.setOutputs(VERSION, outputs);
     }
 
-    /// @notice Exits by claiming all matured POL from the cooldown queue (FIFO, stops at the first non-matured nonce)
-    /// @dev Reverts on the controller with NoOpenNonces(vault) when the queue is empty and NoNoncesReady(vault)
-    ///      when nonces exist but none matured — only call exit when a claim is known to be withdrawable
+    /// @notice Exits by claiming all matured POL from the executor's cooldown queue to the vault
+    /// @dev Fail-loud: controller reverts bubble unchanged — NoOpenNonces(executor) when the queue is empty,
+    ///      NoNoncesReady(executor) when nonces exist but none matured, and pause errors. When POL is parked
+    ///      on the executor with nothing claimable (third-party claim), run the sweep action instead.
     /// @param data The input data containing the controller
-    /// @return polAmount The amount of POL received by the vault
+    /// @return polAmount The amount of POL claimed and delivered to the vault
     function exit(SPOLUnstakeFuseExitData memory data) public returns (uint256 polAmount) {
         if (!PlasmaVaultConfigLib.isSubstrateAsAssetGranted(MARKET_ID, data.controller)) {
             revert SPOLUnstakeFuseUnsupportedController(data.controller);
         }
 
-        ISPOLController controller = ISPOLController(data.controller);
-        IERC20 polToken = IERC20(controller.polToken());
+        address executor = SPOLUnstakeExecutorStorageLib.getExecutor();
+        if (executor == address(0)) {
+            revert SPOLUnstakeFuseExecutorNotDeployed();
+        }
 
-        uint256 polBefore = polToken.balanceOf(address(this));
-
-        controller.withdrawPOL();
-
-        polAmount = polToken.balanceOf(address(this)) - polBefore;
+        polAmount = SPOLUnstakeExecutor(executor).claim(data.controller);
 
         emit SPOLUnstakeFuseExit(
             VERSION,
@@ -197,5 +235,28 @@ contract SPOLUnstakeFuse is IFuseCommon {
         bytes32[] memory outputs = new bytes32[](1);
         outputs[0] = TypeConversionLib.toBytes32(polAmount);
         TransientStorageLib.setOutputs(VERSION, outputs);
+    }
+
+    /// @notice Sweeps a token from the vault's executor to the vault
+    /// @dev Anomaly flush, not part of the normal enter/exit flow: POL parked by third-party permissionless
+    ///      withdrawPOL(executor) calls, donation attacks, or any stranded token. Safe for arbitrary tokens
+    ///      by construction — the executor only ever pays the vault. Runs as a regular FuseAction inside
+    ///      execute(), so this market and its dependency graph refresh atomically with the transfer.
+    /// @param data The input data containing the token to sweep
+    /// @return amount The amount transferred to the vault
+    function sweep(SPOLUnstakeFuseSweepData memory data) public returns (uint256 amount) {
+        address executor = SPOLUnstakeExecutorStorageLib.getExecutor();
+        if (executor == address(0)) {
+            revert SPOLUnstakeFuseExecutorNotDeployed();
+        }
+
+        amount = SPOLUnstakeExecutor(executor).sweep(data.token);
+
+        emit SPOLUnstakeFuseSweep(
+            VERSION,
+            data.token,
+            amount,
+            data.timestamp == 0 ? block.timestamp : data.timestamp
+        );
     }
 }

@@ -19,6 +19,12 @@ struct FullNonceDetails {
 ///         direct burn rights, no approval needed) and queues a fixed POL amount per msg.sender.
 ///         POL matures after the Polygon StakeManager withdrawal delay (~80 checkpoints, ~3 days).
 interface ISPOLController {
+    /// @notice Thrown by withdrawPOL when the caller has no open unstake nonces (selector 0x210f50a4)
+    error NoOpenNonces(address user);
+
+    /// @notice Thrown by withdrawPOL when open nonces exist but none matured yet (selector 0x29b22615)
+    error NoNoncesReady(address user);
+
     /// @notice Unstake sPOL routed across validators (most-overfunded first). Burns msg.sender's sPOL,
     ///         queues the POL equivalent under msg.sender.
     /// @param _amount Amount of sPOL (18 decimals) to unstake
