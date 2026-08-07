@@ -22,8 +22,9 @@ contract SPOLUnstakeFuseTest is Test {
     address private constant CHAINLINK_MATIC_USD = 0x7bAC85A8a13A4BcD8abb3eB7d6b4d632c5a57676;
     address private constant CHAINLINK_FEED_REGISTRY = 0x47Fb2585D2C56Fe188D0E6ec628a38b74fCeeeDf;
 
-    /// @dev sPOL Controller market id; not registered in IporFusionMarkets (added upstream after the fact)
-    uint256 private constant MARKET_ID = 300_001;
+    /// @dev sPOL Controller market id — SAME AS MAINNET (constructor param of the deployed
+    /// v3 fuses 0x1faffa60/0x2170717E; not an IporFusionMarkets constant)
+    uint256 private constant MARKET_ID = 424_243;
     uint256 private constant FORK_BLOCK = 25_580_000;
 
     /// @dev cast index-erc7201 "io.ipor.spolUnstake.Executor"
