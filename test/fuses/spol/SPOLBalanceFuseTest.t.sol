@@ -1,0 +1,190 @@
+// SPDX-License-Identifier: BUSL-1.1
+pragma solidity 0.8.30;
+
+import {Test} from "forge-std/Test.sol";
+import {ERC1967Proxy} from "@openzeppelin/contracts/proxy/ERC1967/ERC1967Proxy.sol";
+
+import {SPOLBalanceFuse} from "../../../contracts/fuses/chains/ethereum/spol/SPOLBalanceFuse.sol";
+import {SPOLUnstakeExecutor} from "../../../contracts/fuses/chains/ethereum/spol/SPOLUnstakeExecutor.sol";
+import {ISPOLController, FullNonceDetails} from "../../../contracts/fuses/chains/ethereum/spol/ext/ISPOLController.sol";
+import {IPriceOracleMiddleware} from "../../../contracts/price_oracle/IPriceOracleMiddleware.sol";
+import {PriceOracleMiddleware} from "../../../contracts/price_oracle/PriceOracleMiddleware.sol";
+import {PlasmaVaultConfigLib} from "../../../contracts/libraries/PlasmaVaultConfigLib.sol";
+import {PlasmaVaultMock} from "../PlasmaVaultMock.sol";
+
+contract SPOLBalanceFuseTest is Test {
+    address private constant SPOL_CONTROLLER = 0xEaadA411F2600570796c341552b9869DA708a28B;
+    address private constant POL = 0x455e53CBB86018Ac2B8092FdCd39d8444aFFC3F6;
+    address private constant SPOL = 0x3B790d651e950497c7723D47B24E6f61534f7969;
+    /// @dev Chainlink MATIC/USD aggregator, used as the POL price source
+    address private constant CHAINLINK_MATIC_USD = 0x7bAC85A8a13A4BcD8abb3eB7d6b4d632c5a57676;
+    address private constant CHAINLINK_FEED_REGISTRY = 0x47Fb2585D2C56Fe188D0E6ec628a38b74fCeeeDf;
+
+    /// @dev sPOL Controller market id — SAME AS MAINNET (constructor param of the deployed
+    /// v3 fuses 0x1faffa60/0x2170717E; not an IporFusionMarkets constant)
+    uint256 private constant MARKET_ID = 424_243;
+    uint256 private constant FORK_BLOCK = 25_580_000;
+
+    /// @dev cast index-erc7201 "io.ipor.spolUnstake.Executor"
+    bytes32 private constant EXECUTOR_SLOT = 0xa56afc2a6b08675c3b996ba4937d309d4c4219c04c5fbdd338969f8501e0d200;
+
+    PriceOracleMiddleware private priceOracleMiddlewareProxy;
+    SPOLBalanceFuse private balanceFuse;
+    PlasmaVaultMock private vault;
+    address private executor;
+
+    function setUp() public {
+        vm.createSelectFork(vm.envString("ETHEREUM_PROVIDER_URL"), FORK_BLOCK);
+
+        PriceOracleMiddleware implementation = new PriceOracleMiddleware(CHAINLINK_FEED_REGISTRY);
+        priceOracleMiddlewareProxy = PriceOracleMiddleware(
+            address(
+                new ERC1967Proxy(address(implementation), abi.encodeWithSignature("initialize(address)", address(this)))
+            )
+        );
+
+        address[] memory assets = new address[](1);
+        assets[0] = POL;
+        address[] memory sources = new address[](1);
+        sources[0] = CHAINLINK_MATIC_USD;
+        priceOracleMiddlewareProxy.setAssetsPricesSources(assets, sources);
+
+        balanceFuse = new SPOLBalanceFuse(MARKET_ID);
+        vault = new PlasmaVaultMock(address(0), address(balanceFuse));
+        vault.setPriceOracleMiddleware(address(priceOracleMiddlewareProxy));
+
+        executor = address(new SPOLUnstakeExecutor(address(vault)));
+    }
+
+    function testShouldSetupImmutables() external {
+        assertEq(balanceFuse.MARKET_ID(), MARKET_ID, "MARKET_ID should match");
+        assertEq(balanceFuse.VERSION(), address(balanceFuse), "VERSION should be the fuse address");
+    }
+
+    function testShouldRevertWhenMarketIdIsZero() external {
+        vm.expectRevert(SPOLBalanceFuse.SPOLBalanceFuseInvalidMarketId.selector);
+        new SPOLBalanceFuse(0);
+    }
+
+    function testShouldReturnZeroWhenNoSubstrateGranted() external {
+        assertEq(vault.balanceOf(), 0, "Balance should be 0 without substrates");
+    }
+
+    function testShouldReturnZeroWhenExecutorNotDeployed() external {
+        _grantControllerSubstrate();
+
+        assertEq(vault.balanceOf(), 0, "Balance should be 0 before the executor exists");
+    }
+
+    function testShouldReturnZeroWhenQueueIsEmpty() external {
+        _grantControllerSubstrate();
+        _setExecutor();
+
+        assertEq(vault.balanceOf(), 0, "Balance should be 0 for an empty unstake queue");
+    }
+
+    function testShouldValuePendingNoncesInUsd() external {
+        _grantControllerSubstrate();
+        _setExecutor();
+
+        FullNonceDetails[] memory nonces = new FullNonceDetails[](3);
+        nonces[0] = FullNonceDetails({validatorId: 1, amount: 100e18, validatorNonce: 1, nonce: 1});
+        nonces[1] = FullNonceDetails({validatorId: 2, amount: 250e18, validatorNonce: 7, nonce: 2});
+        nonces[2] = FullNonceDetails({validatorId: 3, amount: 123456789012345678, validatorNonce: 9, nonce: 3});
+
+        vm.mockCall(
+            SPOL_CONTROLLER,
+            abi.encodeWithSelector(ISPOLController.getUserOpenNonces.selector, executor),
+            abi.encode(nonces)
+        );
+
+        uint256 pendingPol = 100e18 + 250e18 + 123456789012345678;
+        (uint256 price, ) = priceOracleMiddlewareProxy.getAssetPrice(POL);
+        assertGt(price, 0, "POL price should be available on the fork");
+
+        // POL is 18 decimals, middleware price is WAD: usd = pendingPol * price / 1e18
+        assertEq(vault.balanceOf(), (pendingPol * price) / 1e18, "Balance should be the priced sum of open nonces");
+    }
+
+    function testShouldCountExecutorHeldPol() external {
+        // post-third-party-claim state: queue empty, POL parked on the executor
+        _grantControllerSubstrate();
+        _setExecutor();
+
+        uint256 parked = 42e18;
+        deal(POL, executor, parked);
+
+        (uint256 price, ) = priceOracleMiddlewareProxy.getAssetPrice(POL);
+        assertEq(vault.balanceOf(), (parked * price) / 1e18, "Executor-held POL should be counted");
+    }
+
+    function testShouldSumPendingNoncesAndExecutorPol() external {
+        _grantControllerSubstrate();
+        _setExecutor();
+
+        FullNonceDetails[] memory nonces = new FullNonceDetails[](1);
+        nonces[0] = FullNonceDetails({validatorId: 1, amount: 100e18, validatorNonce: 1, nonce: 1});
+        vm.mockCall(
+            SPOL_CONTROLLER,
+            abi.encodeWithSelector(ISPOLController.getUserOpenNonces.selector, executor),
+            abi.encode(nonces)
+        );
+        deal(POL, executor, 50e18);
+
+        (uint256 price, ) = priceOracleMiddlewareProxy.getAssetPrice(POL);
+        assertEq(vault.balanceOf(), ((100e18 + 50e18) * price) / 1e18, "Pending + executor POL should be summed");
+    }
+
+    function testShouldRevertWhenMultipleSubstratesGranted() external {
+        // this market supports exactly one controller substrate - misconfiguration must fail loud
+        bytes32[] memory substrates = new bytes32[](2);
+        substrates[0] = PlasmaVaultConfigLib.addressToBytes32(SPOL_CONTROLLER);
+        substrates[1] = PlasmaVaultConfigLib.addressToBytes32(makeAddr("secondController"));
+        vault.grantMarketSubstrates(MARKET_ID, substrates);
+        _setExecutor();
+
+        vm.expectRevert(SPOLBalanceFuse.SPOLBalanceFuseMultipleSubstratesNotSupported.selector);
+        vault.balanceOf();
+    }
+
+    function testShouldNotCountSpolOnExecutor() external {
+        _grantControllerSubstrate();
+        _setExecutor();
+
+        deal(SPOL, executor, 100e18);
+
+        assertEq(vault.balanceOf(), 0, "sPOL resting on the executor should not be counted");
+    }
+
+    function testShouldRevertWhenPolPriceIsZero() external {
+        _grantControllerSubstrate();
+        _setExecutor();
+
+        FullNonceDetails[] memory nonces = new FullNonceDetails[](1);
+        nonces[0] = FullNonceDetails({validatorId: 1, amount: 100e18, validatorNonce: 1, nonce: 1});
+
+        vm.mockCall(
+            SPOL_CONTROLLER,
+            abi.encodeWithSelector(ISPOLController.getUserOpenNonces.selector, executor),
+            abi.encode(nonces)
+        );
+        vm.mockCall(
+            address(priceOracleMiddlewareProxy),
+            abi.encodeWithSelector(IPriceOracleMiddleware.getAssetPrice.selector, POL),
+            abi.encode(uint256(0), uint256(18))
+        );
+
+        vm.expectRevert(abi.encodeWithSelector(SPOLBalanceFuse.SPOLBalanceFusePolPriceIsZero.selector, POL));
+        vault.balanceOf();
+    }
+
+    function _setExecutor() private {
+        vm.store(address(vault), EXECUTOR_SLOT, bytes32(uint256(uint160(executor))));
+    }
+
+    function _grantControllerSubstrate() private {
+        bytes32[] memory substrates = new bytes32[](1);
+        substrates[0] = PlasmaVaultConfigLib.addressToBytes32(SPOL_CONTROLLER);
+        vault.grantMarketSubstrates(MARKET_ID, substrates);
+    }
+}
